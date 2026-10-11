@@ -1,0 +1,108 @@
+# Docker Compose — MAX-бот «IT-служба колледжа»
+# Запуск:    docker compose up -d --build
+# Логи:      docker compose logs -f bot
+# Остановка: docker compose down
+#
+# Примечание: заголовок "version" в Compose Spec устарел (Docker Compose v2+
+# определяет версию через CLI, например `docker compose version` → v2.x).
+
+name: max-it-service-bot
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis — хранилище состояний FSM (многошаговые диалоги создания заявок)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: max_bot_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"          # можно убрать публикацию наружу в production
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Бот — webhook-сервер (aiohttp) + aiogram Dispatcher
+  # ---------------------------------------------------------------------------
+  bot:
+    build:
+      context: .             # контекст — корень репозитория (пакет max_bot/)
+      dockerfile: Dockerfile
+    image: max-it-service-bot:latest
+    container_name: max_it_bot
+    restart: unless-stopped
+    env_file:
+      - max_bot/.env         # конфигурация бота (см. max_bot/.env.example)
+    environment:
+      # Переопределяем адреса сервисов внутри сети compose
+      REDIS_URL: redis://redis:6379/0
+      CORE_API_URL: ${CORE_API_URL:-http://core-api:8000}
+    ports:
+      - "8080:8080"          # вход для вебхуков MAX (за TLS-терминатором: nginx/traefik)
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - max_bot_net
+
+  # ---------------------------------------------------------------------------
+  # Фоновый воркер уведомлений (Этап 7 ТЗ, опционально)
+  # Периодически опрашивает Core API и доставляет уведомления в MAX
+  # ---------------------------------------------------------------------------
+  notification-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: max-it-service-bot:latest
+    container_name: max_bot_notifier
+    restart: unless-stopped
+    command: ["python", "-m", "max_bot.notification_worker"]
+    env_file:
+      - max_bot/.env
+    environment:
+      CORE_API_URL: ${CORE_API_URL:-http://core-api:8000}
+    depends_on:
+      bot:
+        condition: service_started
+    networks:
+      - max_bot_net
+
+  # ---------------------------------------------------------------------------
+  # Пример reverse-proxy с TLS (раскомментируйте при деплое на сервере)
+  # MAX доставляет вебхуки по HTTPS, поэтому перед ботом ставится TLS-терминатор
+  # ---------------------------------------------------------------------------
+  # nginx:
+  #   image: nginx:1.27-alpine
+  #   container_name: max_bot_nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+  #     - ./deploy/certs:/etc/nginx/certs:ro
+  #   depends_on:
+  #     - bot
+  #   networks:
+  #     - max_bot_net
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  max_bot_net:
+    driver: bridge
